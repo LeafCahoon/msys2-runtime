@@ -190,30 +190,62 @@ open_shared (const WCHAR *name, int n, HANDLE& shared_h, DWORD size,
 void
 user_info::initialize ()
 {
-  /* Wait for initialization of the Cygwin per-user shared, if necessary */
-  spinlock sversion (version, CURR_USER_MAGIC);
-  if (!sversion)
+  if ((ULONG) version != CURR_USER_MAGIC)
     {
-      cb = sizeof (*user_shared);
-      /* Initialize mount table from system fstab prior to calling
-         internal_getpwsid.  This allows to convert pw_dir and pw_shell
-	 paths given in DOS notation to valid POSIX paths.  */
-      mountinfo.init (false);
-      cygpsid sid (cygheap->user.sid ());
-      struct passwd *pw = internal_getpwsid (sid);
-      /* Correct the user name with what's defined in /etc/passwd before
-	 loading the user fstab file. */
-      if (pw)
-	cygheap->user.set_name (pw->pw_name);
-      /* After fetching the user infos, add mount entries from user's fstab. */
-      mountinfo.init (true);
+      WCHAR name[UNLEN + 1];
+      WCHAR mutex_name[UNLEN + 32];
+      cygheap->user.get_windows_id (name);
+      __small_swprintf (mutex_name, L"%W.%d.init", name, USER_VERSION);
+      HANDLE init_mutex = CreateMutexW (&sec_none_nih, FALSE, mutex_name);
+      if (!init_mutex)
+	api_fatal ("CreateMutex %W, %E.  Terminating.", mutex_name);
+      DWORD wait = WaitForSingleObject (init_mutex, INFINITE);
+      if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+	api_fatal ("WaitForSingleObject %W returned %u, %E.  Terminating.",
+		   mutex_name, wait);
+
+      if ((ULONG) version == CURR_USER_MAGIC)
+	/* Initialized while we waited. */;
+      else if (version == 0 || version == -1 || wait == WAIT_ABANDONED)
+	{
+	  /* An abandoned mutex means the previous initializer died part way
+	     through.  Discard what it left and start over. */
+	  if (wait == WAIT_ABANDONED)
+	    {
+	      debug_printf ("user shared initializer died, rebuilding");
+	      memset ((void *) this, 0, sizeof (*this));
+	    }
+	  cb = sizeof (*user_shared);
+	  /* Initialize mount table from system fstab prior to calling
+	     internal_getpwsid.  This allows to convert pw_dir and pw_shell
+	     paths given in DOS notation to valid POSIX paths.  */
+	  mountinfo.init (false);
+	  cygpsid sid (cygheap->user.sid ());
+	  struct passwd *pw = internal_getpwsid (sid);
+	  /* Correct the user name with what's defined in /etc/passwd before
+	     loading the user fstab file. */
+	  if (pw)
+	    cygheap->user.set_name (pw->pw_name);
+	  /* After fetching the user infos, add mount entries from user's
+	     fstab. */
+	  mountinfo.init (true);
+	  InterlockedExchange (&version, (LONG) CURR_USER_MAGIC);
+	}
+      else
+	{
+	  LONG found = version;
+	  ReleaseMutex (init_mutex);
+	  CloseHandle (init_mutex);
+	  multiple_cygwin_problem ("user shared memory version", found,
+				   CURR_USER_MAGIC);
+	  return;
+	}
+      ReleaseMutex (init_mutex);
+      CloseHandle (init_mutex);
     }
-  else if (sversion != CURR_USER_MAGIC)
-    sversion.multiple_cygwin_problem ("user shared memory version", version,
-				      sversion);
-  else if (user_shared->cb != sizeof (*user_shared))
-    sversion.multiple_cygwin_problem ("user shared memory size", cb,
-				      sizeof (*user_shared));
+  if (cb != sizeof (*user_shared))
+    multiple_cygwin_problem ("user shared memory size", cb,
+			     sizeof (*user_shared));
 }
 
 /* First half of user shared initialization: Create shared mem region. */
